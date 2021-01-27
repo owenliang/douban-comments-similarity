@@ -1,0 +1,5 @@
+certifi==2020.12.5
+jieba==0.42.1
+numpy==1.19.5
+py4j==0.10.9
+pyspark==3.0.1
