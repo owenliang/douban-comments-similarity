@@ -1,9 +1,10 @@
 import os 
-from pyspark.sql import SparkSession
+from pyspark.sql import SparkSession, Window
 from pyspark.sql.functions import *
 from pyspark.sql.types import *
 from pyspark.ml.feature import Word2Vec, Word2VecModel, BucketedRandomProjectionLSH, BucketedRandomProjectionLSHModel
 import jieba
+import re 
 
 """
 说明：word2vec训练词向量，进而得到评论向量，然后LSH快速求评论向量近邻。
@@ -18,7 +19,7 @@ https://spark.apache.org/docs/latest/api/python/pyspark.ml.html?highlight=word2v
 jieba.initialize()
 
 # spark会话（local[*]表示使用所有cpu）
-spark = SparkSession.builder.master('local[*]').config("spark.driver.memory", "8g").appName('douban').getOrCreate()
+spark = SparkSession.builder.master('local[*]').config("spark.driver.memory", "64g").appName('douban').getOrCreate()
 
 # 加载豆瓣数据集
 douban_df = spark.read.csv('./DMSC.csv', header=True)
@@ -32,9 +33,11 @@ douban_df = spark.read.csv('./DMSC.csv', header=True)
 """
 
 # 对评论进行分词
+remove_chars_pattern = re.compile('[·’!"#$%&\'()＃！（）*+,-./:;<=>?@，：?★、…．＞【】［］《》？“”‘’[\\]^_`{|}~]+')
 def jieba_f(line):
+    global remove_chars_pattern
     try:
-        words = jieba.lcut(line, cut_all=False)
+        words = [remove_chars_pattern.sub('', word) for word in jieba.lcut(line, cut_all=False)]
         return words
     except:
         return []
@@ -80,7 +83,7 @@ douban_df = word2vec_model.transform(douban_df)
 """
 
 # 训练LSH实现评论embedding快速近邻向量检索
-lsh = BucketedRandomProjectionLSH(inputCol='Embedding', outputCol='Buckets', numHashTables=3, bucketLength=0.1)
+lsh = BucketedRandomProjectionLSH(inputCol='Embedding', outputCol='Buckets', numHashTables=2, bucketLength=0.1)
 model_path = './lsh_model'
 try:
     lsh_model = BucketedRandomProjectionLSHModel.load(model_path)
@@ -98,9 +101,88 @@ douban_df = lsh_model.transform(douban_df)
 |1  |Avengers Age of Ultron|复仇者联盟2  |2017-01-22|2     |更深的白色      |2015-04-24|2   | 非常失望，剧本完全敷衍了事，主线剧情没突破大家可以理解，可所有的人物都缺乏动机，正邪之间、妇联内部都没什么火花。团结-分裂-团结的三段式虽然老套但其实也可以利用积攒下来的形象魅力搞出意思，但剧本写得非常肤浅、平面。场面上调度混乱呆板，满屏的铁甲审美疲劳。只有笑点算得上差强人意。    |1231|[ , 非常, 失望, ，, 剧本, 完全, 敷衍了事, ，, 主线, 剧情, 没, 突破, 大家, 可以, 理解, ，, 可, 所有, 的, 人物, 都, 缺乏, 动机, ，, 正邪, 之间, 、, 妇联, 内部, 都, 没什么, 火花, 。, 团结, -, 分裂, -, 团结, 的, 三段式, 虽然, 老套, 但, 其实, 也, 可以, 利用, 积攒, 下来, 的, 形象, 魅力, 搞, 出, 意思, ，, 但, 剧本, 写得, 非常, 肤浅, 、, 平面, 。, 场面, 上, 调度, 混乱, 呆板, ，, 满屏, 的, 铁甲, 审美疲劳, 。, 只有, 笑, 点算, 得, 上, 差强人意, 。]                |[0.10207881422985982,0.009545592398087426,-0.005397121676118909,-0.27453956138001895,0.26000592432825304,0.20473303055254424,-0.030830345179022448,-0.07669864853889477,-0.039627203943559945,-0.030836417169378297,0.08670296354173887,-0.11762266961585095,0.3601643921262244,0.11058124398497479,-0.29385836420171874,0.2274733007908231,-0.11165728573062707,0.295819340103374,0.04263881457083654,-0.21918029104155012]  |[[1.0], [-4.0], [-3.0]] |
 """
 
-# 求每个评论的embedding近邻（距离在一定阈值内的所有其他评论）
-douban_df = lsh_model.approxSimilarityJoin(douban_df, douban_df, 0.1, 'Similarity')
-douban_df.show(truncate=False)
+# 求每个评论的embedding近邻
+# 下面将计算并找出与每条评论距离在0.5之内的其他评论，即1条评论对应N行（也可能完美没有满足相似阈值的评论）
+comment_distance = lsh_model.approxSimilarityJoin(douban_df, douban_df, 0.5, 'Distance').select(
+    col('datasetA.ID').alias('ID1'), col('datasetA.Movie_Name_CN').alias('Movie_Name_CN1'), col('datasetA.Comment').alias('Comment1'),
+    col('datasetB.ID').alias('ID2'), col('datasetB.Movie_Name_CN').alias('Movie_Name_CN2'), col('datasetB.Comment').alias('Comment2'),
+    'Distance'
+).filter('datasetA.ID!=datasetB.ID')
+"""
++-------+--------------+---------------------------------+-------+--------------+-------------------------------------------------------+-------------------+
+|ID1    |Movie_Name_CN1|Comment1                         |ID2    |Movie_Name_CN2|Comment2                                               |Distance         |
++-------+--------------+---------------------------------+-------+--------------+-------------------------------------------------------+-------------------+
+|435330 |栀子花开      | 两颗星给李易峰                  |1470972|左耳          | 两颗星给颜值                                          |0.38069596328509925|
+|613184 |西游降魔篇    | 两颗星给黄勃                    |1621735|小时代1       | 一颗星给郭碧婷，一颗星给郭采洁                        |0.48683903755603564|
+|1373353|寻龙诀        | 三颗星给黄渤                    |608897 |西游降魔篇    | 三颗星给黄渤                                          |0.0                |
+|1411122|长城          | 一分滚粗                        |1522164|美人鱼        | 0分拿好滚粗                                           |0.460533064639379  |
+|1522164|美人鱼        | 0分拿好滚粗                     |1710475|小时代3       | 负分滚粗没商量                                        |0.49409727822501526|
+|1619027|小时代1       | 一颗星给hold住姐，一颗星给郭采洁|1298111|寻龙诀        | 一颗星给舒淇，一颗星给黄渤，一颗星给夏雨，一颗星给特效|0.475884983339599  |
+|1635295|小时代1       | 两颗星给摄影                    |1620559|小时代1       | 一颗星给郭采洁一颗星给凤小岳一颗星给全片服装！        |0.48163949367050163|
+|1635403|小时代1       | 一颗星给雪姨                    |1487506|左耳          | 两颗星给杨洋                                          |0.469489490113617  |
 """
 
+# 为每个评论保留top 3相似的评论
+comment_distance.createOrReplaceTempView('comment_distance')
+sql = '''
+-- 保留每个评论的top 3相似评论
+with comment_with_rank as (
+    select 
+        *,
+        row_number() over (partition by ID1 order by Distance asc) Ranking
+    from 
+        comment_distance
+),
+-- 每个评论留1条详情
+comment_info as (
+    select
+        * 
+    from 
+        comment_with_rank
+    where 
+        Ranking=1
+),
+-- 每条评论top3拉平为列
+comment_with_top3 as (
+    select 
+        ID1,
+        collect_set(ID2) Similar_IDs,
+        collect_set(Movie_Name_CN2) Similar_Movie_Name_CNs,
+        collect_set(Comment2) Similar_Comments
+    from 
+        comment_with_rank
+    where 
+        Ranking <= 3
+    group by 
+        ID1
+)
+-- 输出结果
+select 
+    a.ID1 ID,
+    b.Movie_Name_CN1 Movie_Name_CN,
+    b.Comment1 Comment,
+    a.Similar_IDs,
+    a.Similar_Movie_Name_CNs,
+    a.Similar_Comments
+from 
+    comment_with_top3 a
+left join 
+    comment_info b
+on 
+    a.ID1=b.ID1
+'''
+similar_comment = spark.sql(sql)
+similar_comment.show(truncate=False)
+"""
++-------+-------------+-------------------------------------------+---------------------------+-----------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|ID     |Movie_Name_CN|Comment                                    |Similar_IDs                |Similar_Movie_Name_CNs             |Similar_Comments                                                                                                                                                    |
++-------+-------------+-------------------------------------------+---------------------------+-----------------------------------+--------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+|1003663|湄公河行动   | 燃                                        |[413813, 1826585, 21480]   |[大圣归来, 复仇者联盟2, 变形金刚4] |[ 燃]                                                                                                                                                               |
+|100704 |大鱼海棠     | 我是水军                                  |[927552, 732687, 322503]   |[西游伏妖篇, 大圣归来, 泰囧]       |[ 我是水军]                                                                                                                                                         |
+|100735 |大鱼海棠     | 美术四颗星星，剧情倒扣一颗                |[317020, 1342752, 1463529] |[长城, 大圣归来, 寻龙诀]           |[ 两颗星给舒淇，两颗星给陈坤。特技制作倒扣一颗星，故事情节怒扣一颗星！,  特效四分，景甜扣一分,  配音减半颗星，剧情减半颗星，制作加一颗星]                           |
+|1023406|七月与安生   | 三颗半星                                  |[967431, 1325652, 1145942] |[何以笙箫默, 寻龙诀, 复仇者联盟]   |[ 三颗半星,  半颗星]                                                                                                                                                |
+|1046207|七月与安生   | 七月，お元気ですか。                      |[780413, 227188, 1889591]  |[爱乐之城, 你的名字, 十二生肖]     |[ 16 Oct 2016 BIF LFF// 静かな娘の視野で、見知らぬ誰かの姿を映す。君は誰だ？君 の名はなんだ？君のためにここにいる。,  ハイテク、すごい！,  男主补完了！おめでとう！] |
+|1080723|复仇者联盟   | 爽歪歪                                    |[1109289, 1088785, 1081040]|[复仇者联盟]                       |[ 爽歪歪]                                                                                                                                                           |
+|1083168|复仇者联盟   | 黑猫警长大战变形金刚                      |[1104097, 1087274, 1085367]|[复仇者联盟]                       |[ 孙悟空大战葫芦娃,  美国版孙悟空大战黑猫警长...,  美版金刚葫芦娃]                                                                                                  |
+|1087859|复仇者联盟   | 绿巨人是BUG                               |[1123361, 1115515, 1079016]|[复仇者联盟]                       |[ 绿巨人是BUG,  绿巨人就是BUG]                                              
 """
